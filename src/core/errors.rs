@@ -13,6 +13,9 @@ pub enum CoreError {
     SignatureVerificationFailed,
     ConfigError(String),
     SerializationError(String),
+    PolynomialCommitmentError(String),
+    CryptographicError(String),
+    StorageError(String),
 }
 
 impl fmt::Display for CoreError {
@@ -28,6 +31,9 @@ impl fmt::Display for CoreError {
             CoreError::SignatureVerificationFailed => write!(f, "Signature verification failed"),
             CoreError::ConfigError(msg) => write!(f, "Config error: {}", msg),
             CoreError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            CoreError::PolynomialCommitmentError(msg) => write!(f, "Polynomial commitment error: {}", msg),
+            CoreError::CryptographicError(msg) => write!(f, "Cryptographic error: {}", msg),
+            CoreError::StorageError(msg) => write!(f, "Storage error: {}", msg),
         }
     }
 }

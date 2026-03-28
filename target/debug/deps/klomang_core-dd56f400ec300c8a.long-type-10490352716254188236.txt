@@ -1,0 +1,1 @@
+Result<state_manager::StateManager<_>, state_manager::StateManagerError>

@@ -142,40 +142,42 @@ impl GhostDag {
         }
 
         if dag.get_all_hashes().len() == 1 {
-            let only_block_hash = dag.get_all_hashes().first().unwrap().clone();
-            if let Some(b) = dag.get_block(&only_block_hash) {
-                return VirtualBlock {
-                    parents: tips.into_iter().collect(),
-                    selected_parent: b.selected_parent.clone(),
-                    blue_set: b.blue_set.clone(),
-                    red_set: b.red_set.clone(),
-                    blue_score: b.blue_score,
-                };
+            // Safe to unwrap because we just checked len() == 1
+            if let Some(only_block_hash) = dag.get_all_hashes().first() {
+                let only_block_hash = only_block_hash.clone();
+                if let Some(b) = dag.get_block(&only_block_hash) {
+                    return VirtualBlock {
+                        parents: tips.into_iter().collect(),
+                        selected_parent: b.selected_parent.clone(),
+                        blue_set: b.blue_set.clone(),
+                        red_set: b.red_set.clone(),
+                        blue_score: b.blue_score,
+                    };
+                }
             }
         }
 
         let selected_parent = self.select_parent(dag, &tips);
-        if selected_parent.is_none() {
-            return VirtualBlock {
+        if let Some(selected_parent) = selected_parent {
+            let (blue_set, red_set) = self.build_blue_set(dag, &selected_parent, &tips);
+            let parent_score = dag.get_block(&selected_parent).map(|b| b.blue_score).unwrap_or(0);
+            let blue_score = parent_score + (blue_set.len() as u64);
+
+            VirtualBlock {
+                parents: tips.into_iter().collect(),
+                selected_parent: Some(selected_parent),
+                blue_set,
+                red_set,
+                blue_score,
+            }
+        } else {
+            VirtualBlock {
                 parents: tips.into_iter().collect(),
                 selected_parent: None,
                 blue_set: HashSet::new(),
                 red_set: HashSet::new(),
                 blue_score: 0,
-            };
-        }
-
-        let selected_parent = selected_parent.unwrap();
-        let (blue_set, red_set) = self.build_blue_set(dag, &selected_parent, &tips);
-        let parent_score = dag.get_block(&selected_parent).map(|b| b.blue_score).unwrap_or(0);
-        let blue_score = parent_score + (blue_set.len() as u64);
-
-        VirtualBlock {
-            parents: tips.into_iter().collect(),
-            selected_parent: Some(selected_parent),
-            blue_set,
-            red_set,
-            blue_score,
+            }
         }
     }
 

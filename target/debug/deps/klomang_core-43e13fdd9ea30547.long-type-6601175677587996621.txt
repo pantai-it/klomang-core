@@ -1,0 +1,1 @@
+Result<(Vec<[u8; 32]>, Vec<Fp<MontBackend<FrConfig, 4>, 4>>), CoreError>

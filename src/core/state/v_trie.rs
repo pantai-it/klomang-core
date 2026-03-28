@@ -1,5 +1,6 @@
 use crate::core::crypto::verkle::polynomial_commitment::Commitment;
 use crate::core::crypto::verkle::PolynomialCommitment;
+use crate::core::errors::CoreError;
 use crate::core::state::storage::Storage;
 use ark_ec::Group;
 use ark_ed_on_bls12_381_bandersnatch::EdwardsProjective;
@@ -36,10 +37,10 @@ pub struct VerkleTree<S: Storage> {
 }
 
 impl<S: Storage> VerkleTree<S> {
-    pub fn new(storage: S) -> Self {
+    pub fn new(storage: S) -> Result<Self, CoreError> {
         let pc = PolynomialCommitment::new(VERKLE_RADIX);
         let (empty_subtree_roots, empty_subtree_scalars) =
-            Self::compute_empty_subtree_constants(&pc);
+            Self::compute_empty_subtree_constants(&pc)?;
 
         let mut tree = Self {
             storage,
@@ -48,7 +49,7 @@ impl<S: Storage> VerkleTree<S> {
             empty_subtree_scalars,
         };
         tree.ensure_node(&[]);
-        tree
+        Ok(tree)
     }
 
     pub fn insert(&mut self, key: [u8; KEY_SIZE], value: Vec<u8>) {
@@ -63,7 +64,7 @@ impl<S: Storage> VerkleTree<S> {
         self.set_node_value(&path, Some(value));
     }
 
-    pub fn get_root(&self) -> [u8; 32] {
+    pub fn get_root(&self) -> Result<[u8; 32], CoreError> {
         self.compute_node_root_hash(&[], 0)
     }
 
@@ -74,7 +75,7 @@ impl<S: Storage> VerkleTree<S> {
         self.storage.clone()
     }
 
-    pub fn generate_proof(&self, key: [u8; KEY_SIZE]) -> VerkleProof {
+    pub fn generate_proof(&self, key: [u8; KEY_SIZE]) -> Result<VerkleProof, CoreError> {
         let mut siblings = Vec::with_capacity(KEY_SIZE * VERKLE_RADIX);
         let mut path = Vec::new();
         let mut path_exists = true;
@@ -86,7 +87,7 @@ impl<S: Storage> VerkleTree<S> {
                     let mut child_path = path.clone();
                     child_path.push(child_index as u8);
                     if self.node_exists(&child_path) {
-                        self.compute_node_root_hash(&child_path, depth + 1)
+                        self.compute_node_root_hash(&child_path, depth + 1)?
                     } else {
                         empty_child_root
                     }
@@ -116,33 +117,33 @@ impl<S: Storage> VerkleTree<S> {
             ProofType::NonMembership
         };
 
-        VerkleProof {
+        Ok(VerkleProof {
             proof_type,
             path: key.to_vec(),
             siblings,
             leaf_value,
-            root: self.get_root(),
-        }
+            root: self.get_root()?,
+        })
     }
 
-    pub fn verify_proof(&self, proof: &VerkleProof) -> bool {
+    pub fn verify_proof(&self, proof: &VerkleProof) -> Result<bool, CoreError> {
         if proof.path.len() != KEY_SIZE {
-            return false;
+            return Ok(false);
         }
 
         if proof.siblings.len() != KEY_SIZE * VERKLE_RADIX {
-            return false;
+            return Ok(false);
         }
 
         match proof.proof_type {
             ProofType::Membership => {
                 if proof.leaf_value.is_none() {
-                    return false;
+                    return Ok(false);
                 }
             }
             ProofType::NonMembership => {
                 if proof.leaf_value.is_some() {
-                    return false;
+                    return Ok(false);
                 }
             }
         }
@@ -151,15 +152,16 @@ impl<S: Storage> VerkleTree<S> {
             (ProofType::Membership, Some(value)) => {
                 let leaf_scalar = Self::value_to_scalar(value);
                 let leaf_poly = DensePolynomial::from_coefficients_vec(vec![leaf_scalar]);
-                let leaf_commitment = self.pc.commit(&leaf_poly).expect("Polynomial commitment failed");
-                let leaf_root_hash = Self::commitment_root_hash(&leaf_commitment);
+                let leaf_commitment = self.pc.commit(&leaf_poly)
+                    .map_err(|e| CoreError::PolynomialCommitmentError(format!("Failed to commit leaf: {}", e)))?;
+                let leaf_root_hash = Self::commitment_root_hash(&leaf_commitment)?;
                 <EdwardsProjective as Group>::ScalarField::from_le_bytes_mod_order(&leaf_root_hash)
             }
             (ProofType::NonMembership, _) => {
                 let empty_leaf_root = self.empty_subtree_root_hash(KEY_SIZE);
                 <EdwardsProjective as Group>::ScalarField::from_le_bytes_mod_order(&empty_leaf_root)
             }
-            _ => return false,
+            _ => return Ok(false),
         };
 
         let mut computed_root: [u8; 32] = [0u8; 32];
@@ -178,18 +180,19 @@ impl<S: Storage> VerkleTree<S> {
             }
 
             let polynomial = DensePolynomial::from_coefficients_vec(coeffs);
-            let reconstructed_commitment = self.pc.commit(&polynomial).expect("Polynomial commitment failed");
-            let reconstructed_root = Self::commitment_root_hash(&reconstructed_commitment);
+            let reconstructed_commitment = self.pc.commit(&polynomial)
+                .map_err(|e| CoreError::PolynomialCommitmentError(format!("Failed to reconstruct commitment: {}", e)))?;
+            let reconstructed_root = Self::commitment_root_hash(&reconstructed_commitment)?;
 
             computed_root = reconstructed_root;
             current_scalar = <EdwardsProjective as Group>::ScalarField::from_le_bytes_mod_order(&reconstructed_root);
         }
 
         if computed_root != proof.root {
-            return false;
+            return Ok(false);
         }
 
-        true
+        Ok(true)
     }
 
     fn key_for_path(path: &[u8]) -> Vec<u8> {
@@ -260,7 +263,7 @@ impl<S: Storage> VerkleTree<S> {
         self.storage.put(key, Self::serialize_node(value.as_deref()));
     }
 
-    fn compute_node_commitment(&self, path: &[u8], depth: usize) -> Commitment {
+    fn compute_node_commitment(&self, path: &[u8], depth: usize) -> Result<Commitment, CoreError> {
         if depth == KEY_SIZE {
             let leaf_scalar = self
                 .get_node_value(path)
@@ -269,7 +272,8 @@ impl<S: Storage> VerkleTree<S> {
                 .unwrap_or(<EdwardsProjective as Group>::ScalarField::ZERO);
 
             let poly = DensePolynomial::from_coefficients_vec(vec![leaf_scalar]);
-            return self.pc.commit(&poly).expect("Polynomial commitment failed");
+            return self.pc.commit(&poly)
+                .map_err(|e| CoreError::PolynomialCommitmentError(format!("Failed to commit leaf: {}", e)));
         }
 
         let empty_scalar = self.empty_subtree_scalar(depth + 1);
@@ -279,7 +283,7 @@ impl<S: Storage> VerkleTree<S> {
             let mut child_path = path.to_vec();
             child_path.push(child_index as u8);
             let child_scalar = if self.node_exists(&child_path) {
-                let child_root = self.compute_node_root_hash(&child_path, depth + 1);
+                let child_root = self.compute_node_root_hash(&child_path, depth + 1)?;
                 <EdwardsProjective as Group>::ScalarField::from_le_bytes_mod_order(&child_root)
             } else {
                 empty_scalar
@@ -288,32 +292,35 @@ impl<S: Storage> VerkleTree<S> {
         }
 
         let poly = DensePolynomial::from_coefficients_vec(coeffs);
-        self.pc.commit(&poly).expect("Polynomial commitment failed")
+        self.pc.commit(&poly)
+            .map_err(|e| CoreError::PolynomialCommitmentError(format!("Failed to commit node polynomial: {}", e)))
     }
 
     fn compute_empty_subtree_constants(
         pc: &PolynomialCommitment,
-    ) -> (
+    ) -> Result<(
         Vec<[u8; 32]>,
         Vec<<EdwardsProjective as Group>::ScalarField>,
-    ) {
+    ), CoreError> {
         let mut roots = vec![[0u8; 32]; KEY_SIZE + 1];
         let mut scalars = vec![<EdwardsProjective as Group>::ScalarField::ZERO; KEY_SIZE + 1];
 
-        let empty_commitment = pc.commit(&DensePolynomial::from_coefficients_vec(vec![])).expect("Polynomial commitment failed");
-        roots[KEY_SIZE] = Self::commitment_root_hash(&empty_commitment);
+        let empty_commitment = pc.commit(&DensePolynomial::from_coefficients_vec(vec![]))
+            .map_err(|e| CoreError::PolynomialCommitmentError(format!("Failed to commit empty polynomial: {}", e)))?;
+        roots[KEY_SIZE] = Self::commitment_root_hash(&empty_commitment)?;
         scalars[KEY_SIZE] = <EdwardsProjective as Group>::ScalarField::from_le_bytes_mod_order(&roots[KEY_SIZE]);
 
         for depth in (0..KEY_SIZE).rev() {
             let child_scalar = scalars[depth + 1];
             let coeffs = vec![child_scalar; VERKLE_RADIX];
             let polynomial = DensePolynomial::from_coefficients_vec(coeffs);
-            let commitment = pc.commit(&polynomial).expect("Polynomial commitment failed");
-            roots[depth] = Self::commitment_root_hash(&commitment);
+            let commitment = pc.commit(&polynomial)
+                .map_err(|e| CoreError::PolynomialCommitmentError(format!("Failed to commit subtree polynomial: {}", e)))?;
+            roots[depth] = Self::commitment_root_hash(&commitment)?;
             scalars[depth] = <EdwardsProjective as Group>::ScalarField::from_le_bytes_mod_order(&roots[depth]);
         }
 
-        (roots, scalars)
+        Ok((roots, scalars))
     }
 
     fn empty_subtree_root_hash(&self, depth: usize) -> [u8; 32] {
@@ -324,20 +331,20 @@ impl<S: Storage> VerkleTree<S> {
         self.empty_subtree_scalars[depth]
     }
 
-    fn compute_node_root_hash(&self, path: &[u8], depth: usize) -> [u8; 32] {
-        let commitment = self.compute_node_commitment(path, depth);
+    fn compute_node_root_hash(&self, path: &[u8], depth: usize) -> Result<[u8; 32], CoreError> {
+        let commitment = self.compute_node_commitment(path, depth)?;
         Self::commitment_root_hash(&commitment)
     }
 
-    fn commitment_root_hash(commitment: &Commitment) -> [u8; 32] {
+    fn commitment_root_hash(commitment: &Commitment) -> Result<[u8; 32], CoreError> {
         let mut bytes = Vec::new();
         commitment
             .0
             .serialize_uncompressed(&mut bytes)
-            .expect("Commitment serialization failure");
+            .map_err(|e| CoreError::SerializationError(format!("Failed to serialize commitment: {}", e)))?;
 
         let hash = blake3::hash(&bytes);
-        *hash.as_bytes()
+        Ok(*hash.as_bytes())
     }
 
     fn value_to_scalar(value: &[u8]) -> <EdwardsProjective as Group>::ScalarField {
@@ -354,93 +361,98 @@ mod tests {
     #[test]
     fn test_vtrie_insert_and_root_stability() {
         let storage = MemoryStorage::new();
-        let mut tree = VerkleTree::new(storage);
+        let mut tree = VerkleTree::new(storage).expect("failed to create VerkleTree");
 
         let key = [1u8; KEY_SIZE];
         let value = b"hello".to_vec();
 
         tree.insert(key, value.clone());
-        let root1 = tree.get_root();
+        let root1 = tree.get_root().expect("failed to get root");
         assert_ne!(root1, [0u8; 32]);
 
         tree.insert(key, value);
-        let root2 = tree.get_root();
+        let root2 = tree.get_root().expect("failed to get root");
         assert_eq!(root1, root2);
     }
 
     #[test]
     fn test_vtrie_generate_and_verify_proof() {
         let storage = MemoryStorage::new();
-        let mut tree = VerkleTree::new(storage);
+        let mut tree = VerkleTree::new(storage).expect("failed to create VerkleTree");
 
         let key = [10u8; KEY_SIZE];
         let value = b"verkle".to_vec();
 
         tree.insert(key, value.clone());
 
-        let proof = tree.generate_proof(key);
+        let proof = tree.generate_proof(key).expect("failed to generate proof");
 
         assert_eq!(proof.leaf_value, Some(value));
         assert_eq!(proof.proof_type, ProofType::Membership);
-        assert!(tree.verify_proof(&proof));
+        let is_valid = tree.verify_proof(&proof).expect("failed to verify proof");
+        assert!(is_valid);
     }
 
     #[test]
     fn test_vtrie_non_membership_proof() {
         let storage = MemoryStorage::new();
-        let mut tree = VerkleTree::new(storage);
+        let mut tree = VerkleTree::new(storage).expect("failed to create VerkleTree");
 
         let inserted_key = [10u8; KEY_SIZE];
         let inserted_value = b"verkle".to_vec();
         tree.insert(inserted_key, inserted_value);
 
         let missing_key = [11u8; KEY_SIZE];
-        let proof = tree.generate_proof(missing_key);
+        let proof = tree.generate_proof(missing_key).expect("failed to generate proof");
 
         assert_eq!(proof.leaf_value, None);
         assert_eq!(proof.proof_type, ProofType::NonMembership);
-        assert!(tree.verify_proof(&proof));
+        let is_valid = tree.verify_proof(&proof).expect("failed to verify proof");
+        assert!(is_valid);
     }
 
     #[test]
     fn test_vtrie_invalid_proof_modified_root_hash() {
         let storage = MemoryStorage::new();
-        let mut tree = VerkleTree::new(storage);
+        let mut tree = VerkleTree::new(storage).expect("failed to create VerkleTree");
 
         let key = [20u8; KEY_SIZE];
         tree.insert(key, b"value".to_vec());
 
-        let mut proof = tree.generate_proof(key);
+        let mut proof = tree.generate_proof(key).expect("failed to generate proof");
         proof.root[0] ^= 0xFF;
 
-        assert!(!tree.verify_proof(&proof));
+        let is_valid = tree.verify_proof(&proof).expect("failed to verify proof");
+        assert!(!is_valid);
     }
 
     #[test]
     fn test_vtrie_invalid_proof_modified_path() {
         let storage = MemoryStorage::new();
-        let mut tree = VerkleTree::new(storage);
+        let mut tree = VerkleTree::new(storage).expect("failed to create VerkleTree");
 
         let key = [30u8; KEY_SIZE];
         tree.insert(key, b"value".to_vec());
 
-        let mut proof = tree.generate_proof(key);
+        let mut proof = tree.generate_proof(key).expect("failed to generate proof");
         proof.path[0] = proof.path[0].wrapping_add(1);
 
-        assert!(!tree.verify_proof(&proof));
+        let is_valid = tree.verify_proof(&proof).expect("failed to verify proof");
+        assert!(!is_valid);
     }
 
     #[test]
     fn test_vtrie_invalid_siblings_length() {
         let storage = MemoryStorage::new();
-        let mut tree = VerkleTree::new(storage);
+        let mut tree = VerkleTree::new(storage).expect("failed to create VerkleTree");
 
         let key = [40u8; KEY_SIZE];
         tree.insert(key, b"value".to_vec());
 
-        let mut proof = tree.generate_proof(key);
+        let mut proof = tree.generate_proof(key).expect("failed to generate proof");
         proof.siblings.pop();
 
-        assert!(!tree.verify_proof(&proof));
+        let is_valid = tree.verify_proof(&proof).expect("failed to verify proof");
+        assert!(!is_valid);
     }
 }
