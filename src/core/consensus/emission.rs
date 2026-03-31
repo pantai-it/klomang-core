@@ -2,10 +2,27 @@
 ///
 /// Calculates block rewards based on DAA score (blue score)
 /// Ensures total supply never exceeds MAX_SUPPLY
+/// 
+/// HARD CAP POLICY: 600,000,000 SLUG coins (600M)
+/// This is locked as an immutable constant and enforced at all emission points.
+use crate::core::consensus::economic_constants;
+
 pub const COIN_UNIT: u64 = 100_000_000; // 1 SLUG = 10^8 smallest units
 pub const UNIT: u128 = COIN_UNIT as u128; // 8 decimal places
-pub const MAX_GLOBAL_SUPPLY: u128 = 600_000_000_000_000_000; // 600M in Nano-SLUG (smallest unit)
+
+/// Hard cap: 600 million SLUG in smallest units (Nano-SLUG)
+/// 
+/// This constant is locked by economic_constants module and cannot be changed.
+/// Any attempt to exceed this will result in zero reward issuance.
+pub const MAX_GLOBAL_SUPPLY: u128 = economic_constants::MAX_GLOBAL_SUPPLY_NANO_SLUG;
 pub const MAX_SUPPLY: u128 = MAX_GLOBAL_SUPPLY;
+
+/// Compile-time verification: ensure MAX_SUPPLY is exactly 600M in Nano-SLUG
+const _: () = {
+    assert!(MAX_GLOBAL_SUPPLY == 600_000_000_000_000_000,
+            "MAX_GLOBAL_SUPPLY must be exactly 600,000,000 SLUG (600M in Nano-SLUG)");
+};
+
 pub const BASE_REWARD: u128 = 100u128 * UNIT; // initial block reward (100 coins)
 pub const HALVING_INTERVAL: u64 = 100_000;
 pub const MIN_REWARD: u128 = 1; // 1 smallest unit (sat equivalent)
@@ -112,20 +129,31 @@ pub fn total_emitted(daa_score: u64) -> u128 {
 }
 
 /// Calculate capped reward that won't exceed total supply
-/// Returns the actual reward amount that can be issued
+/// 
+/// HARD CAP VALIDATION:
+/// - If total emitted >= MAX_SUPPLY (600M), returns 0 (no new coins)
+/// - If total emitted + base_reward > MAX_SUPPLY, returns remaining cap
+/// - Otherwise returns calculated base_reward
+/// 
+/// Returns: The actual reward amount that can be issued without exceeding cap
+/// 
+/// This ensures that the blockchain can NEVER issue more than 600,000,000 SLUG coins.
 pub fn capped_reward(daa_score: u64) -> u128 {
     let current_total = total_emitted(daa_score);
     let base_reward = raw_block_reward(daa_score);
 
+    // Hard cap check: if we've already emitted the maximum, new blocks earn 0
     if current_total >= MAX_SUPPLY {
         return 0;
     }
 
+    // Partial emission: cap the reward to not exceed the limit
     if current_total + base_reward > MAX_SUPPLY {
-        MAX_SUPPLY.saturating_sub(current_total)
-    } else {
-        base_reward
+        return MAX_SUPPLY.saturating_sub(current_total);
     }
+
+    // Normal emission: return calculated reward
+    base_reward
 }
 
 /// Validate reward split does not exceed capped reward

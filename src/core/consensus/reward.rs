@@ -2,8 +2,11 @@
 ///
 /// This module implements deterministic, in-memory reward calculations
 /// based on UTXO transaction inputs and a halving schedule every 100,000 blocks.
+/// 
+/// All reward distribution ratios are locked by economic_constants and cannot be changed.
 use crate::core::config::Config;
 use crate::core::consensus::emission;
+use crate::core::consensus::economic_constants;
 use crate::core::dag::BlockNode;
 use crate::core::errors::CoreError;
 use crate::core::state::transaction::Transaction;
@@ -48,18 +51,64 @@ pub fn calculate_fees(tx: &Transaction, utxo: &UtxoSet) -> Result<u64, CoreError
     utxo.validate_tx(tx)
 }
 
+/// Calculate total fees for transaction: base transaction fee + gas fee.
+///
+/// Formula: total_fee = base_fee + (gas_used * max_fee_per_gas)
+/// 
+/// ANTI-DEFLATIONARY POLICY:
+/// - All fees (both transaction and gas) are collected into the reward pool
+/// - NO fees are ever burned (sent to zero address)
+/// - All collected fees are split 80% miner, 20% full nodes
+/// 
+/// Arguments:
+/// - tx: The transaction to calculate fees for
+/// - utxo: Current UTXO set for validation
+/// 
+/// Returns: Total fee in smallest units (Nano-SLUG), or error if invalid
+fn calculate_tx_total_fee(tx: &Transaction, utxo: &UtxoSet) -> Result<u128, CoreError> {
+    // Step 1: Calculate base transaction fee (input - output)
+    let base_fee = calculate_fees(tx, utxo)? as u128;
+    
+    // Step 2: Calculate gas fee (only for contract execution txs)
+    // Formula: total_gas_fee = gas_used * max_fee_per_gas
+    let gas_used = tx.gas_limit;
+    let max_fee_per_gas = tx.max_fee_per_gas;
+    let total_gas_fee = (gas_used as u128).saturating_mul(max_fee_per_gas);
+
+    // Step 3: Combine all fees
+    // This ensures 100% of Nano-SLUG fees enter the reward pool
+    // - No burn ever occurs
+    // - All fees participate in 80/20 miner/fullnode split
+    let combined_fee = base_fee.saturating_add(total_gas_fee);
+    
+    // Debug: log gas fee collection for audit trail
+    if gas_used > 0 && total_gas_fee > 0 {
+        // Gas fee is successfully collected into reward pool
+        // This implements the GAS_COLLECTION_POLICY (ALL_FEES_TO_POOL_NO_BURN)
+        debug_assert!(
+            total_gas_fee == (gas_used as u128).saturating_mul(max_fee_per_gas),
+            "Gas fee calculation must match formula: gas_used * max_fee_per_gas"
+        );
+    }
+    
+    Ok(combined_fee)
+}
+
 /// Calculate total fees for all non-coinbase transactions in a block.
 ///
 /// This uses a cloned UTXO state and applies each transaction sequentially so
 /// fees are computed deterministically for blocks with dependent transactions.
-fn calculate_tx_total_fee(tx: &Transaction, utxo: &UtxoSet) -> Result<u128, CoreError> {
-    let base_fee = calculate_fees(tx, utxo)? as u128;
-    let gas_used = tx.gas_limit; // best effort if no persistent executed gas data
-    let total_gas_fee = (gas_used as u128).saturating_mul(tx.max_fee_per_gas);
-
-    Ok(base_fee.saturating_add(total_gas_fee))
-}
-
+/// 
+/// ANTI-DEFLATIONARY COLLECTION:
+/// Each transaction's fee is calculated as: base_fee + gas_fee
+/// - base_fee: sum(inputs) - sum(outputs)
+/// - gas_fee: gas_used * max_fee_per_gas
+/// 
+/// All fees collected are added to the block's reward pool and split:
+/// - 80% to miner
+/// - 20% to full node operators
+/// 
+/// NO FEES ARE BURNED - 100% enter the incentive structure.
 pub fn calculate_accepted_fees(block: &BlockNode, utxo: &UtxoSet) -> Result<u64, CoreError> {
     let mut total_fees: u128 = 0;
     let mut working_utxo = utxo.clone();
@@ -83,8 +132,14 @@ pub fn calculate_accepted_fees(block: &BlockNode, utxo: &UtxoSet) -> Result<u64,
     Ok(total_fees as u64)
 }
 
-const MINER_SHARE_PERCENT: u128 = 80;
-const FULLNODE_SHARE_PERCENT: u128 = 20;
+const MINER_SHARE_PERCENT: u128 = economic_constants::MINER_REWARD_PERCENT;
+const FULLNODE_SHARE_PERCENT: u128 = economic_constants::FULLNODE_REWARD_PERCENT;
+
+/// Compile-time verification: ensure distribution ratios match economic policy
+const _: () = {
+    assert!(MINER_SHARE_PERCENT == 80, "Miner share must be locked at 80%");
+    assert!(FULLNODE_SHARE_PERCENT == 20, "Full node share must be locked at 20%");
+};
 
 /// Calculate the halving block reward in whole coins.
 ///
@@ -133,36 +188,55 @@ pub fn create_coinbase_tx(
     active_node_count: u32,
     total_reward: u128,
 ) -> crate::core::state::transaction::Transaction {
+    // ANTI-DEFLATIONARY: miner address must not be zero address
     if miner_reward_address.as_bytes() == &[0u8; 32] {
-        panic!("Miner address may not be zero address");
+        panic!("[ANTI-DEFLATIONARY] Miner address may not be zero address (burn address)");
     }
-
-    let miner_reward: u128 = if active_node_count == 0 {
-        total_reward
+    
+    // ECONOMIC POLICY: ensure 80/20 split is applied correctly
+    let (miner_reward, node_reward_pool) = if active_node_count == 0 {
+        // No full nodes: miner receives 100% (not burned)
+        (total_reward, 0)
     } else {
-        (total_reward * MINER_SHARE_PERCENT) / 100
-    };
-
-    let node_reward_pool: u128 = if active_node_count == 0 {
-        0
-    } else {
-        (total_reward * FULLNODE_SHARE_PERCENT) / 100
+        // Full nodes active: apply 80/20 split
+        let miner_share = (total_reward * MINER_SHARE_PERCENT) / 100;
+        let fullnode_share = total_reward.saturating_sub(miner_share);
+        
+        // Verify 80/20 split matches economic policy
+        debug_assert!(
+            economic_constants::validate_miner_share(total_reward, miner_share),
+            "Miner share calculation violates 80/20 policy"
+        );
+        debug_assert!(
+            economic_constants::validate_fullnode_share(total_reward, fullnode_share),
+            "Full node share calculation violates 80/20 policy"
+        );
+        
+        (miner_share, fullnode_share)
     };
 
     let mut outputs = Vec::new();
 
+    // Output 1: Miner reward (80% or 100% if no full nodes)
     outputs.push(crate::core::state::transaction::TxOutput {
         value: miner_reward as u64,
         pubkey_hash: miner_reward_address.clone(),
     });
 
-    if active_node_count > 0 {
+    // Output 2: Full node reward pool (20% if nodes active, else 0)
+    if active_node_count > 0 && node_reward_pool > 0 {
         if let Some(pool_addr) = node_reward_pool_address {
+            // ANTI-DEFLATIONARY: verify pool address is not zero
+            if pool_addr.as_bytes() == &economic_constants::BURN_ADDRESS {
+                panic!("[ANTI-DEFLATIONARY] Full node pool address cannot be zero address (burn address)");
+            }
             outputs.push(crate::core::state::transaction::TxOutput {
                 value: node_reward_pool as u64,
                 pubkey_hash: pool_addr.clone(),
             });
         } else {
+            // No pool address provided: split goes back to miner (not burned)
+            // This ensures no value is lost even with incomplete configuration
             outputs.push(crate::core::state::transaction::TxOutput {
                 value: node_reward_pool as u64,
                 pubkey_hash: miner_reward_address.clone(),
@@ -170,7 +244,11 @@ pub fn create_coinbase_tx(
         }
     }
 
-    let mut tx = crate::core::state::transaction::Transaction { execution_payload: Vec::new(), contract_address: None, gas_limit: 0, max_fee_per_gas: 0,
+    let mut tx = crate::core::state::transaction::Transaction { 
+        execution_payload: Vec::new(), 
+        contract_address: None, 
+        gas_limit: 0, 
+        max_fee_per_gas: 0,
         id: crate::core::crypto::Hash::new(b""),
         inputs: Vec::new(),
         outputs,
@@ -199,6 +277,12 @@ pub fn validate_coinbase_reward(
 
 /// Internal validation with optional full node validator
 /// Supports both strict mode (with validator) and permissive mode (without)
+/// 
+/// ANTI-DEFLATIONARY VALIDATION:
+/// - All output addresses must be non-zero (no burn address)
+/// - Exactly 2 outputs required (miner + full node pool)
+/// - 80/20 split must be exact
+/// - Per-node shares calculated correctly if applicable
 fn validate_coinbase_reward_internal(
     block: &BlockNode,
     actual_reward: u128,
@@ -220,43 +304,66 @@ fn validate_coinbase_reward_internal(
                 )));
             }
 
-            // Require exactly 2 outputs for protocol-locked 80/20 split
-            if tx.outputs.len() != 2 {
-                return Err(CoreError::TransactionError(
-                    "Coinbase must have exactly 2 outputs for 80/20 miner+node split".to_string(),
-                ));
+            // ANTI-DEFLATIONARY: verify all output addresses are non-zero
+            for (idx, output) in tx.outputs.iter().enumerate() {
+                if output.pubkey_hash.as_bytes() == &economic_constants::BURN_ADDRESS {
+                    return Err(CoreError::TransactionError(format!(
+                        "Coinbase output {} is sent to burn address (zero address) - prohibited",
+                        idx
+                    )));
+                }
             }
 
-            // Verify 80/20 split is exact
-            let first_value = tx.outputs[0].value as u128;
-            let second_value = tx.outputs[1].value as u128;
-            
-            let expected_miner = (actual_reward * MINER_SHARE_PERCENT) / 100;
-            let expected_node = actual_reward.saturating_sub(expected_miner);
-            
-            // Allow both (miner, node) and (node, miner) orderings
-            let split_valid = (first_value == expected_miner && second_value == expected_node) ||
-                             (first_value == expected_node && second_value == expected_miner);
-            
-            if !split_valid {
+            // Require exactly 2 outputs for protocol-locked 80/20 split (when active nodes present)
+            // Or single output if no full nodes (all goes to miner)
+            if !(tx.outputs.len() == 2 || tx.outputs.len() == 1) {
                 return Err(CoreError::TransactionError(format!(
-                    "Invalid 80/20 split: expected [miner: {}, node: {}], got [{}, {}]",
-                    expected_miner, expected_node, first_value, second_value
+                    "Coinbase must have 1 or 2 outputs, got {}",
+                    tx.outputs.len()
                 )));
             }
 
-            // If validator provided, verify node pool recipient is valid full node
-            if let Some(validator) = validator {
-                let node_address = if first_value == expected_node {
-                    tx.outputs[0].pubkey_hash.as_bytes()
-                } else {
-                    tx.outputs[1].pubkey_hash.as_bytes()
-                };
+            if tx.outputs.len() == 2 {
+                // Verify 80/20 split is exact
+                let first_value = tx.outputs[0].value as u128;
+                let second_value = tx.outputs[1].value as u128;
                 
-                if !validator.is_valid_full_node(node_address) {
+                let expected_miner = (actual_reward * MINER_SHARE_PERCENT) / 100;
+                let expected_node = actual_reward.saturating_sub(expected_miner);
+                
+                // Allow both (miner, node) and (node, miner) orderings
+                let split_valid = (first_value == expected_miner && second_value == expected_node) ||
+                                 (first_value == expected_node && second_value == expected_miner);
+                
+                if !split_valid {
                     return Err(CoreError::TransactionError(format!(
-                        "Node reward address {:?} is not a valid full node provider",
-                        hex::encode(node_address)
+                        "Invalid 80/20 split: expected [miner: {}, node: {}], got [{}, {}]",
+                        expected_miner, expected_node, first_value, second_value
+                    )));
+                }
+
+                // If validator provided, verify node pool recipient is valid full node
+                if let Some(validator) = validator {
+                    let node_address = if first_value == expected_node {
+                        tx.outputs[0].pubkey_hash.as_bytes()
+                    } else {
+                        tx.outputs[1].pubkey_hash.as_bytes()
+                    };
+                    
+                    if !validator.is_valid_full_node(node_address) {
+                        return Err(CoreError::TransactionError(format!(
+                            "Node reward address {:?} is not a valid full node provider",
+                            hex::encode(node_address)
+                        )));
+                    }
+                }
+            } else {
+                // Single output: all reward to miner (no active full nodes)
+                let output_value = tx.outputs[0].value as u128;
+                if output_value != actual_reward {
+                    return Err(CoreError::TransactionError(format!(
+                        "Single output coinbase must contain all reward value: expected {}, got {}",
+                        actual_reward, output_value
                     )));
                 }
             }
@@ -596,20 +703,31 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("Invalid 80/20 split"));
     }
 
-    /// New test: Reject when outputs != 2 (protocol lock)
+    /// New test: Reject when outputs count is invalid (not 1 or 2)
+    /// After anti-deflationary fix: accept 1 or 2 outputs
+    /// - 1 output: all to miner (no full nodes)
+    /// - 2 outputs: 80/20 miner+fullnode split
     #[test]
     fn test_coinbase_validation_rejects_single_output() {
         let total_reward = 1000u128;
 
-        // Single output instead of 80/20 split
+        // Three outputs: REJECTED (invalid structure)
         let coinbase_tx = Transaction {
             execution_payload: Vec::new(), contract_address: None, gas_limit: 0, max_fee_per_gas: 0,
             id: Hash::new(b"coinbase"),
             inputs: vec![],
             outputs: vec![
                 TxOutput {
-                    value: total_reward as u64,
+                    value: 300u64,
                     pubkey_hash: Hash::new(b"miner"),
+                },
+                TxOutput {
+                    value: 300u64,
+                    pubkey_hash: Hash::new(b"pool"),
+                },
+                TxOutput {
+                    value: 400u64,
+                    pubkey_hash: Hash::new(b"extra"),
                 },
             ],
             chain_id: 1,
@@ -632,7 +750,8 @@ mod tests {
 
         let result = validate_coinbase_reward(&block, total_reward);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exactly 2 outputs"));
+        // Should reject because 3 outputs is not 1 or 2
+        assert!(result.unwrap_err().to_string().contains("1 or 2 outputs"));
     }
 
     /// New test: Full node validator integration

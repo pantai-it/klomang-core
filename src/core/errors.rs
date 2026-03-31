@@ -6,7 +6,7 @@ pub enum CoreError {
     BlockNotFound,
     InvalidParent,
     DuplicateBlock,
-    ConsensusError,
+    ConsensusError(String),
     TransactionError(String),
     InvalidSignature,
     InvalidPublicKey,
@@ -17,6 +17,7 @@ pub enum CoreError {
     CryptographicError(String),
     StorageError(String),
     PrunedData(String),
+    InvalidState(String),
 }
 
 impl fmt::Display for CoreError {
@@ -25,7 +26,7 @@ impl fmt::Display for CoreError {
             CoreError::BlockNotFound => write!(f, "Block not found"),
             CoreError::InvalidParent => write!(f, "Invalid parent"),
             CoreError::DuplicateBlock => write!(f, "Duplicate block"),
-            CoreError::ConsensusError => write!(f, "Consensus error"),
+            CoreError::ConsensusError(msg) => write!(f, "Consensus error: {}", msg),
             CoreError::TransactionError(msg) => write!(f, "Transaction error: {}", msg),
             CoreError::InvalidSignature => write!(f, "Invalid signature"),
             CoreError::InvalidPublicKey => write!(f, "Invalid public key"),
@@ -36,6 +37,7 @@ impl fmt::Display for CoreError {
             CoreError::CryptographicError(msg) => write!(f, "Cryptographic error: {}", msg),
             CoreError::StorageError(msg) => write!(f, "Storage error: {}", msg),
             CoreError::PrunedData(msg) => write!(f, "Pruned data access error: {}", msg),
+            CoreError::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
         }
     }
 }

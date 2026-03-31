@@ -37,11 +37,11 @@ impl Dag {
         }
 
         if block.parents.contains(&id) {
-            return Err(crate::core::errors::CoreError::ConsensusError);
+            return Err(crate::core::errors::CoreError::ConsensusError("Block cannot reference itself as parent".to_string()));
         }
 
         if block.parents.is_empty() && !self.blocks.is_empty() {
-            return Err(crate::core::errors::CoreError::ConsensusError);
+            return Err(crate::core::errors::CoreError::ConsensusError("Genesis block already exists".to_string()));
         }
 
         for parent in &block.parents {
@@ -51,7 +51,7 @@ impl Dag {
 
             let ancestor_set = self.get_ancestors(parent);
             if ancestor_set.contains(&id) {
-                return Err(crate::core::errors::CoreError::ConsensusError);
+                return Err(crate::core::errors::CoreError::ConsensusError("Cycle detected via parents / ancestors".to_string()));
             }
         }
 

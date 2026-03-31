@@ -1,7 +1,34 @@
 use crate::core::crypto::Hash;
 
-/// Calculate hash of block header using Blake3
-pub fn calculate_hash(header: &[u8]) -> Hash {
+/// Calculate hash by combining required block header fields in deterministic order.
+/// Fields: timestamp, difficulty, parent hashes (sorted), merit, nonce, transaction root.
+pub fn calculate_hash(
+    timestamp: u64,
+    difficulty: u64,
+    parent_hashes: &[Hash],
+    merit: u64,
+    nonce: u64,
+    tx_merkle_root: &Hash,
+) -> Hash {
+    let mut data = Vec::new();
+    data.extend_from_slice(&timestamp.to_le_bytes());
+    data.extend_from_slice(&difficulty.to_le_bytes());
+
+    let mut parents: Vec<_> = parent_hashes.iter().collect();
+    parents.sort();
+    for parent in parents {
+        data.extend_from_slice(parent.as_bytes());
+    }
+
+    data.extend_from_slice(&merit.to_le_bytes());
+    data.extend_from_slice(&nonce.to_le_bytes());
+    data.extend_from_slice(tx_merkle_root.as_bytes());
+
+    Hash::new(&data)
+}
+
+/// Legacy helper for raw header bytes; may be used for deterministic hashing of structured bytes.
+pub fn calculate_hash_raw(header: &[u8]) -> Hash {
     Hash::new(header)
 }
 
@@ -19,24 +46,45 @@ pub fn is_valid_pow(hash: &Hash, target: u64) -> bool {
 /// Mine a block by finding a valid nonce with miner and node reward addresses
 /// Includes address fields in hashed input to ensure explicit minting destination.
 /// This guards coinbase issuance by making reward addresses part of PoW input.
+/// Now includes all critical header fields for comprehensive pre-image attack protection.
 pub fn mine_block(
     header: &[u8],
     target: u64,
     miner_address: &[u8],
     node_reward_address: &[u8],
+    timestamp: u64,
+    difficulty: u64,
+    parent_hashes: &[crate::core::crypto::Hash],
+    verkle_root: &[u8; 32],
 ) -> Option<u64> {
     if miner_address.is_empty() || node_reward_address.is_empty() {
         return None;
     }
 
-    for nonce in 0..=u64::MAX {
-        let mut header_with_nonce = header.to_vec();
-        header_with_nonce.extend_from_slice(&nonce.to_le_bytes());
-        header_with_nonce.extend_from_slice(miner_address);
-        header_with_nonce.extend_from_slice(node_reward_address);
+    let tx_merkle_root = Hash::new(header); // deterministic representation of payload header for PoW
 
-        let hash = calculate_hash(&header_with_nonce);
-        if is_valid_pow(&hash, target) {
+    for nonce in 0..=u64::MAX {
+        // Using the structured hash function that covers all header fields deterministically
+        let hash = calculate_hash(
+            timestamp,
+            difficulty,
+            parent_hashes,
+            0, // merit (blue_score) unknown for mining, typically set to 0 during candidate mining
+            nonce,
+            &tx_merkle_root,
+        );
+
+        // Include reward addresses as additional nonce-like entropy via parent hash derivation path
+        // (to preserve previous behavior and protect candidate pool uniqueness)
+        let mut with_rewards = Vec::new();
+        with_rewards.extend_from_slice(hash.as_bytes());
+        with_rewards.extend_from_slice(verkle_root);
+        with_rewards.extend_from_slice(miner_address);
+        with_rewards.extend_from_slice(node_reward_address);
+
+        let final_hash = Hash::new(&with_rewards);
+
+        if is_valid_pow(&final_hash, target) {
             return Some(nonce);
         }
     }

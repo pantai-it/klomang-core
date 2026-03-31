@@ -2,7 +2,7 @@
 //! Validates that parallel transaction execution produces identical results to sequential execution
 //! as manifested by identical Verkle Tree root hashes.
 
-use klomang_core::core::crypto::Hash;
+use klomang_core::core::crypto::{Hash, schnorr::KeyPairWrapper};
 use klomang_core::core::state::transaction::{Transaction, TxOutput, TxInput};
 use klomang_core::core::state::utxo::UtxoSet;
 use klomang_core::core::state::MemoryStorage;
@@ -10,6 +10,140 @@ use klomang_core::core::state::v_trie::VerkleTree;
 use klomang_core::core::state_manager::{StateManager};
 use klomang_core::core::scheduler::parallel::ParallelScheduler;
 use rand::SeedableRng;
+
+// ============================================================================
+// WASM PAYLOAD GENERATOR - Generates valid, deterministic WASM modules from seed
+// ============================================================================
+
+/// Generates a valid minimal WASM module deterministically from a seed value.
+/// 
+/// The generated WASM includes:
+/// - Valid WASM magic number and version
+/// - Type section with function signatures
+/// - Function section declaring functions
+/// - Code section with minimal function bodies
+/// - Deterministic content based on seed (no actual randomness)
+fn generate_valid_wasm_payload(seed: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    
+    // WASM magic number and version
+    payload.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d]); // Magic: "\0asm"
+    payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // Version: 1
+    
+    // Type section (section id: 1)
+    // Defines function signatures
+    let mut type_section = Vec::new();
+    type_section.push(1); // One function type
+    
+    // Function type: i32 -> i32 (takes one i32 param, returns one i32)
+    type_section.push(0x60); // func type
+    type_section.push(1);    // num params
+    type_section.push(0x7f); // param type: i32
+    type_section.push(1);    // num results
+    type_section.push(0x7f); // result type: i32
+    
+    // Create type section with length encoding
+    let mut type_section_with_length = Vec::new();
+    encode_leb128(&mut type_section_with_length, type_section.len() as u32);
+    type_section_with_length.extend_from_slice(&type_section);
+    
+    // Add type section header
+    payload.push(1); // Type section id
+    payload.extend_from_slice(&type_section_with_length);
+    
+    // Function section (section id: 3)
+    // Declares how many functions we have
+    let num_functions = ((seed % 5) as u32) + 1; // 1-5 functions based on seed
+    let mut func_section = Vec::new();
+    encode_leb128(&mut func_section, num_functions);
+    for _ in 0..num_functions {
+        func_section.push(0); // All functions use type 0 (i32 -> i32)
+    }
+    
+    let mut func_section_with_length = Vec::new();
+    encode_leb128(&mut func_section_with_length, func_section.len() as u32);
+    func_section_with_length.extend_from_slice(&func_section);
+    
+    payload.push(3); // Function section id
+    payload.extend_from_slice(&func_section_with_length);
+    
+    // Code section (section id: 10)
+    // Contains function bodies
+    let mut code_entries = Vec::new();
+    encode_leb128(&mut code_entries, num_functions);
+    
+    for i in 0..num_functions {
+        let seed_offset = seed.wrapping_add(i as u64);
+        let local_count = (seed_offset % 3) as u32; // 0-2 local variables
+        
+        let mut code_body = Vec::new();
+        // Local declarations
+        if local_count > 0 {
+            code_body.push(1); // One group of locals
+            code_body.push(local_count as u8); // How many locals in this group
+            code_body.push(0x7f); // Type: i32
+        } else {
+            code_body.push(0); // No locals
+        }
+        
+        // Function body: simple constant + return
+        // This creates deterministic but unique functions based on seed
+        let constant = ((seed_offset as u32) ^ ((seed_offset >> 32) as u32)) & 0x7F;
+        code_body.push(0x41); // i32.const
+        encode_leb128(&mut code_body, constant);
+        code_body.push(0x0B); // end
+        
+        // Add code entry with size
+        let mut code_with_size = Vec::new();
+        encode_leb128(&mut code_with_size, code_body.len() as u32);
+        code_with_size.extend_from_slice(&code_body);
+        code_entries.extend_from_slice(&code_with_size);
+    }
+    
+    let mut code_section_with_length = Vec::new();
+    encode_leb128(&mut code_section_with_length, code_entries.len() as u32);
+    code_section_with_length.extend_from_slice(&code_entries);
+    
+    payload.push(10); // Code section id
+    payload.extend_from_slice(&code_section_with_length);
+    
+    payload
+}
+
+/// Encode a value using LEB128 variable-length encoding (used by WASM format)
+fn encode_leb128(output: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80; // Set continuation bit
+        }
+        output.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Generate deterministic Schnorr signature (64 bytes) from seed using real cryptographic key.
+fn generate_signature(seed: u64) -> Vec<u8> {
+    let keypair = KeyPairWrapper::from_seed(seed)
+        .expect("deterministic keypair derivation should not fail");
+    let message = seed.to_be_bytes();
+    keypair.sign(&message).to_bytes().to_vec()
+}
+
+/// Generate deterministic public key (33 bytes, compressed) from seed.
+fn generate_pubkey(seed: u64) -> Vec<u8> {
+    let keypair = KeyPairWrapper::from_seed(seed)
+        .expect("deterministic keypair derivation should not fail");
+    keypair.public_key().to_bytes().to_vec()
+}
+
+/// Generate deterministic 32-byte key from seed using cryptographic hash.
+fn generate_key(seed: u64) -> [u8; 32] {
+    *Hash::new(&seed.to_le_bytes()).as_bytes()
+}
 
 /// Generate random transaction with deterministic seed for reproducibility
 fn generate_random_transaction(seed: u64, prev_tx_count: usize) -> Transaction {
@@ -23,8 +157,8 @@ fn generate_random_transaction(seed: u64, prev_tx_count: usize) -> Transaction {
             inputs.push(TxInput {
                 prev_tx: Hash::new(&prev_index.to_le_bytes()),
                 index: (seed as u32 + i as u32) % 4,
-                signature: vec![seed as u8; 32],
-                pubkey: vec![seed as u8; 32],
+                signature: generate_signature(seed.wrapping_add(i as u64)),
+                pubkey: generate_pubkey(seed.wrapping_add(i as u64 * 2)),
                 sighash_type: klomang_core::core::state::transaction::SigHashType::All,
             });
         }
@@ -36,18 +170,18 @@ fn generate_random_transaction(seed: u64, prev_tx_count: usize) -> Transaction {
     for i in 0..output_count {
         outputs.push(TxOutput {
             value: seed.saturating_mul(i as u64 + 1).saturating_add(1_000),
-            pubkey_hash: Hash::new(&[(seed as u8).wrapping_add(i as u8); 32]),
+            pubkey_hash: Hash::new(&generate_key(seed.wrapping_add(i as u64 * 3))),
         });
     }
     
     let mut tx = Transaction::new(inputs, outputs);
     
     // Set contract address deterministically to create contract execution load
+    // and use generated valid WASM payload instead of dummy bytes
     if seed % 5 == 0 {
-        tx.contract_address = Some([(seed as u8 + 1); 32]);
-        let payload_size = ((seed % 2048) + 64) as usize;
-        let payload_byte = (seed ^ 0xFF) as u8;
-        tx.execution_payload = vec![payload_byte; payload_size];
+        tx.contract_address = Some(generate_key(seed.wrapping_add(100)));
+        // Use generated valid WASM payload instead of repeated dummy bytes
+        tx.execution_payload = generate_valid_wasm_payload(seed);
         tx.gas_limit = 100_000u64.saturating_add(seed % 500_000);
         tx.max_fee_per_gas = 10u128 + (seed % 100) as u128;
     }
@@ -203,25 +337,20 @@ fn test_parallel_scheduling_conflict_detection() {
 /// Test: Access set generation from payloads
 #[test]
 fn test_payload_analysis_access_sets() {
-    // Create transaction with WASM payload
+    // Create transaction with valid WASM payload (not dummy bytes)
     let mut tx = Transaction::default();
     
-    // Create a small WASM module (minimal valid WASM)
-    // Magic number + version
-    let payload = vec![
-        0x00, 0x61, 0x73, 0x6d,  // WASM magic
-        0x01, 0x00, 0x00, 0x00,  // Version
-        // Add some dummy bytes to simulate payload
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
+    // Create a valid WASM module deterministically from seed
+    let seed = 12345u64;
+    let payload = generate_valid_wasm_payload(seed);
     
     tx.execution_payload = payload;
-    tx.contract_address = Some([1; 32]);
+    tx.contract_address = Some(generate_key(seed.wrapping_add(50)));
     
     let access_set = tx.generate_access_set();
     
     // Access set should include contract address
-    assert!(access_set.write_set.contains(&[1; 32]),
+    assert!(access_set.write_set.contains(&generate_key(seed.wrapping_add(50))),
             "Contract address not in write set");
     
     // Access set should also have payload-derived accesses
@@ -259,4 +388,34 @@ fn test_deterministic_transaction_ordering() {
     }
     
     println!("Deterministic scheduling verified across multiple runs");
+}
+
+/// Test: Access set generation determinism across multiple calls
+#[test]
+fn test_access_set_determinism() {
+    let seed = 12345u64;
+    let tx = generate_random_transaction(seed, 0);
+    
+    // Generate access set multiple times
+    let access_set1 = tx.generate_access_set();
+    let access_set2 = tx.generate_access_set();
+    let access_set3 = tx.generate_access_set();
+    
+    // All should be identical
+    assert_eq!(access_set1, access_set2, "Access set generation not deterministic between calls");
+    assert_eq!(access_set2, access_set3, "Access set generation not deterministic between calls");
+    
+    // Verify specific properties are consistent
+    assert_eq!(access_set1.read_set.len(), access_set2.read_set.len(), "Read set sizes differ");
+    assert_eq!(access_set1.write_set.len(), access_set2.write_set.len(), "Write set sizes differ");
+    
+    // Check that sets contain the same elements
+    for key in &access_set1.read_set {
+        assert!(access_set2.read_set.contains(key), "Read set missing key: {:?}", key);
+    }
+    for key in &access_set1.write_set {
+        assert!(access_set2.write_set.contains(key), "Write set missing key: {:?}", key);
+    }
+    
+    println!("Access set determinism verified: identical results across multiple generations");
 }

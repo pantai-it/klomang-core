@@ -5,7 +5,11 @@ use crate::core::state::utxo::{OutPoint, UtxoSet};
 use crate::core::state::v_trie::VerkleTree;
 use crate::core::state::PruneMarker;
 use crate::core::vm::VMExecutor;
+use crate::core::consensus::{economic_constants, ghostdag::GhostDag};
+use crate::core::dag::Dag;
+use crate::core::errors::CoreError;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Minimal state container exposing the current Verkle root.
 #[derive(Debug, Clone)]
@@ -18,6 +22,16 @@ pub struct State {
 pub struct StateSnapshot {
     pub height: u64,
     pub root: [u8; 32],
+    pub total_supply: u128, // Track total supply for validation
+    pub gas_fees: Vec<GasFeeWitness>, // Gas fee witnesses for the block
+}
+
+/// Gas fee distribution witness for 80/20 validation
+#[derive(Debug, Clone)]
+pub struct GasFeeWitness {
+    pub total_gas_fee: u128,
+    pub miner_share: u128,
+    pub fullnode_share: u128,
 }
 
 /// Error types untuk StateManager operations
@@ -28,6 +42,22 @@ pub enum StateManagerError {
     ApplyBlockFailed(String),
     RestoreFailed(String),
     CryptographicError(String),
+    SupplyCapExceeded(String),
+    BurnAddressViolation(String),
+}
+
+impl std::fmt::Display for StateManagerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StateManagerError::InvalidRollback(msg) => write!(f, "Invalid rollback: {}", msg),
+            StateManagerError::SnapshotNotFound(height) => write!(f, "Snapshot not found at height {}", height),
+            StateManagerError::ApplyBlockFailed(msg) => write!(f, "Apply block failed: {}", msg),
+            StateManagerError::RestoreFailed(msg) => write!(f, "Restore failed: {}", msg),
+            StateManagerError::CryptographicError(msg) => write!(f, "Cryptographic error: {}", msg),
+            StateManagerError::SupplyCapExceeded(msg) => write!(f, "Supply cap exceeded: {}", msg),
+            StateManagerError::BurnAddressViolation(msg) => write!(f, "Burn address violation: {}", msg),
+        }
+    }
 }
 
 /// Basic state manager for applying blocks, tracking snapshots, and rolling back.
@@ -36,9 +66,16 @@ pub struct StateManager<S: Storage + Clone> {
     pub tree: VerkleTree<S>,
     pub current_height: u64,
     pub snapshots: Vec<StateSnapshot>,
-    snapshot_storages: Vec<S>,
+    pub snapshot_storages: Vec<S>,
     pub prune_markers: HashMap<OutPoint, PruneMarker>,
     pub outpoint_to_key: HashMap<OutPoint, [u8; 32]>,
+    pub current_total_supply: u128, // Running total supply tracker
+    pub block_gas_fees: Vec<GasFeeWitness>, // Gas fee witnesses per block
+    pub pending_updates: Vec<([u8; 32], Vec<u8>)>, // Pending state updates for atomic application
+    /// Atomic operation flag to prevent concurrent state modifications
+    pub applying_block: std::sync::atomic::AtomicBool,
+    /// Guard untuk prevent race condition saat apply_block dijalankan bersamaan
+    pub apply_lock: std::sync::Mutex<()>,
 }
 
 impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
@@ -50,19 +87,61 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
         Ok(Self {
             tree,
             current_height: 0,
-            snapshots: vec![StateSnapshot { height: 0, root }],
+            snapshots: vec![StateSnapshot { height: 0, root, total_supply: 0, gas_fees: Vec::new() }],
             snapshot_storages: vec![storage_snapshot],
             prune_markers: HashMap::new(),
             outpoint_to_key: HashMap::new(),
+            current_total_supply: 0,
+            block_gas_fees: Vec::new(),
+            pending_updates: Vec::new(),
+            applying_block: std::sync::atomic::AtomicBool::new(false),
+            apply_lock: std::sync::Mutex::new(()),
         })
     }
 
-    /// Apply block dengan full error handling dan DAG reorganization support
+    /// Atomic operation - prevents concurrent modifications
     pub fn apply_block(&mut self, block: &BlockNode, utxo: &mut UtxoSet) -> Result<(), StateManagerError> {
+        // Acquire exclusive lock when starting block application
+        let lock_ptr = &self.apply_lock as *const std::sync::Mutex<()>;
+        let _apply_guard = unsafe { (&*lock_ptr).lock().map_err(|e| StateManagerError::ApplyBlockFailed(
+            format!("Failed to acquire apply lock: {}", e)
+        ))? };
+
+        // Check if another block application is already in progress
+        if self.applying_block.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StateManagerError::ApplyBlockFailed(
+                "Concurrent block application not allowed".to_string()
+            ));
+        }
+
+        // Set atomic flag and ensure it resets in Drop guard
+        self.applying_block.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let applying_block_ptr = &self.applying_block as *const std::sync::atomic::AtomicBool;
+        struct AtomicFlagGuard(*const std::sync::atomic::AtomicBool);
+        impl Drop for AtomicFlagGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    (*self.0).store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        let _guard = AtomicFlagGuard(applying_block_ptr);
+
+        // Clear pending updates for new block
+        self.pending_updates.clear();
+
+        // Reset gas fees untuk block baru
+        self.block_gas_fees.clear();
+
         // Process transactions untuk state update
         for tx in &block.transactions {
             self.apply_transaction(tx, utxo)?;
         }
+
+        // Apply all pending updates atomically with anti-burn and supply cap checks
+        self.tree.apply_state_transition(self.pending_updates.clone(), self.current_total_supply)
+            .map_err(|e| StateManagerError::ApplyBlockFailed(format!("State transition failed: {}", e)))?;
 
         self.current_height += 1;
 
@@ -71,14 +150,45 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
         self.snapshots.push(StateSnapshot {
             height: self.current_height,
             root: new_root,
+            total_supply: self.current_total_supply,
+            gas_fees: self.block_gas_fees.clone(),
         });
         self.snapshot_storages.push(self.tree.storage_clone());
 
         Ok(())
     }
 
+    /// Validate block with consensus rules and apply atomically
+    /// This ensures consensus validation happens before any state changes
+    pub fn validate_and_apply_block(
+        &mut self,
+        block: &BlockNode,
+        utxo: &mut UtxoSet,
+        dag: &Dag,
+        consensus: &GhostDag
+    ) -> Result<(), StateManagerError> {
+        // Get current time for validation
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| StateManagerError::CryptographicError(format!("Time error: {}", e)))?
+            .as_secs();
+
+        // First, validate block with consensus rules
+        consensus.validate_block(block, dag, &self.tree, current_time)?;
+
+        // Check finality constraints for reorganization
+        if !consensus.can_reorganize(dag, &block.id)? {
+            return Err(StateManagerError::ApplyBlockFailed(
+                "Block reorganization would violate finality constraints".to_string()
+            ));
+        }
+
+        // Only after consensus validation passes, apply the block
+        self.apply_block(block, utxo)
+    }
+
     /// Apply transaction dengan error handling untuk validation
-    fn apply_transaction(&mut self, tx: &Transaction, utxo: &mut UtxoSet) -> Result<(), StateManagerError> {
+    pub fn apply_transaction(&mut self, tx: &Transaction, utxo: &mut UtxoSet) -> Result<(), StateManagerError> {
         if tx.execution_payload.is_empty() && tx.contract_address.is_none() {
             self.apply_utxo_transaction(tx, utxo)
         } else {
@@ -88,9 +198,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
 
     /// Internal helper: apply standar UTXO-only transaction
     fn apply_utxo_transaction(&mut self, tx: &Transaction, utxo: &mut UtxoSet) -> Result<(), StateManagerError> {
-        // Process inputs (remove from UTXO set)
+        // Process inputs (remove from UTXO set and subtract from total supply)
         for input in &tx.inputs {
             let outpoint = (input.prev_tx.clone(), input.index);
+            if let Some(output) = utxo.utxos.get(&outpoint) {
+                // Subtract spent amount from total supply
+                self.current_total_supply = self.current_total_supply.saturating_sub(output.value as u128);
+            }
             utxo.utxos.remove(&outpoint);
             self.outpoint_to_key.remove(&outpoint);
             self.prune_markers.remove(&outpoint);
@@ -101,8 +215,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
             let key = tx.hash_with_index(i as u32);
             let outpoint = (tx.id.clone(), i as u32);
             utxo.utxos.insert(outpoint.clone(), output.clone());
-            self.tree.insert(key, output.serialize());
+            self.pending_updates.push((key, output.serialize()));
             self.outpoint_to_key.insert(outpoint.clone(), key);
+
+            // Add new output amount to total supply
+            self.current_total_supply = self.current_total_supply.saturating_add(output.value as u128);
         }
 
         Ok(())
@@ -136,6 +253,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
             Ok(gas_used) => {
                 let total_gas_fee = (gas_used as u128).saturating_mul(tx.max_fee_per_gas);
 
+                // Create gas fee distribution witness untuk 80/20 validation
+                let gas_witness = self.create_gas_fee_witness(total_gas_fee);
+                self.block_gas_fees.push(gas_witness);
+
                 // Gas fee is accounted for and pooled, no burn.
                 // This will be included in reward calculations in consensus/reward.rs.
                 let _ = (gas_used, tx.max_fee_per_gas, total_gas_fee); // keep info for debugging, avoid warning
@@ -152,10 +273,44 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
         }
     }
 
+    /// Verify gas fee distribution witnesses untuk 80/20 compliance
+    pub fn verify_gas_fee_distribution(&self, witness: &GasFeeWitness) -> bool {
+        // Verify 80/20 split calculation
+        let expected_miner = (witness.total_gas_fee * economic_constants::MINER_REWARD_PERCENT) / 100;
+        let expected_fullnode = witness.total_gas_fee.saturating_sub(expected_miner);
+        
+        witness.miner_share == expected_miner && 
+        witness.fullnode_share == expected_fullnode &&
+        witness.miner_share + witness.fullnode_share == witness.total_gas_fee
+    }
+
+    /// Verify global supply cap is not exceeded
+    pub fn verify_global_supply(&self) -> Result<(), StateManagerError> {
+        if self.current_total_supply > economic_constants::MAX_GLOBAL_SUPPLY_NANO_SLUG {
+            return Err(StateManagerError::SupplyCapExceeded(
+                format!("Total supply {} exceeds maximum allowed {}", 
+                        self.current_total_supply, economic_constants::MAX_GLOBAL_SUPPLY_NANO_SLUG)
+            ));
+        }
+        Ok(())
+    }
+
     /// Get root hash dari current state
     pub fn get_root_hash(&self) -> Result<[u8; 32], StateManagerError> {
         self.tree.get_root()
             .map_err(|e| StateManagerError::CryptographicError(format!("Failed to get root: {}", e)))
+    }
+
+    /// Create gas fee distribution witness untuk 80/20 validation
+    pub fn create_gas_fee_witness(&self, total_gas_fee: u128) -> GasFeeWitness {
+        let miner_share = (total_gas_fee * economic_constants::MINER_REWARD_PERCENT) / 100;
+        let fullnode_share = total_gas_fee.saturating_sub(miner_share);
+        
+        GasFeeWitness {
+            total_gas_fee,
+            miner_share,
+            fullnode_share,
+        }
     }
 
     /// Get state snapshot pada specific height
@@ -194,6 +349,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
         self.tree = VerkleTree::new(snapshot_storage.clone())
             .map_err(|e| StateManagerError::RestoreFailed(format!("Failed to restore tree: {}", e)))?;
         
+        // Restore total supply from snapshot
+        self.current_total_supply = self.snapshots[target_height as usize].total_supply;
+        
+        // Restore gas fees from snapshot
+        self.block_gas_fees = self.snapshots[target_height as usize].gas_fees.clone();
+        
         // Verify restoration
         let restored_root = self.get_root_hash()?;
         let snapshot_root = self.snapshots[target_height as usize].root;
@@ -209,23 +370,70 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
     }
 
     /// Legacy rollback method - should use rollback_state() instead
-    pub fn rollback(&mut self, target_height: u64) {
-        assert!(target_height <= self.current_height);
+    pub fn rollback(&mut self, target_height: u64) -> Result<(), StateManagerError> {
+        if target_height > self.current_height {
+            return Err(StateManagerError::InvalidRollback(format!(
+                "Requested rollback to {} is beyond current height {}",
+                target_height, self.current_height
+            )));
+        }
 
-        self.snapshots.truncate(target_height as usize + 1);
-        self.snapshot_storages.truncate(target_height as usize + 1);
-        self.current_height = target_height;
+        // Keep safe backup in case restore fails.
+        let backup_tree = self.tree.clone();
+        let backup_height = self.current_height;
+        let backup_snapshots = self.snapshots.clone();
+        let backup_snapshot_storages = self.snapshot_storages.clone();
+        let backup_total_supply = self.current_total_supply;
+        let backup_gas_fees = self.block_gas_fees.clone();
 
-        let snapshot_storage = self
-            .snapshot_storages
-            .get(target_height as usize)
-            .expect("rollback snapshot missing");
+        match self.rollback_state(target_height) {
+            Ok(()) => {
+                // Additional verification: ensure root hash matches snapshot after successful rollback
+                // This catches any silent corruption that might have occurred during restoration
+                if let Ok(current_root) = self.get_root_hash() {
+                    let expected_root = self.snapshots[target_height as usize].root;
+                    if current_root != expected_root {
+                        eprintln!(
+                            "[CRITICAL] Silent corruption detected after rollback: root mismatch at height {}. Expected {:?}, got {:?}. Attempting emergency restore.",
+                            target_height, expected_root, current_root
+                        );
+                        
+                        // Emergency restore from backup
+                        self.tree = backup_tree;
+                        self.current_height = backup_height;
+                        self.snapshots = backup_snapshots;
+                        self.snapshot_storages = backup_snapshot_storages;
+                        self.current_total_supply = backup_total_supply;
+                        self.block_gas_fees = backup_gas_fees;
+                        
+                        return Err(StateManagerError::RestoreFailed(
+                            format!("Silent corruption detected: root hash mismatch after rollback to height {}", target_height)
+                        ));
+                    }
+                } else {
+                    eprintln!(
+                        "[WARNING] Could not verify root hash after rollback to height {}: get_root_hash failed. Proceeding with caution.",
+                        target_height
+                    );
+                }
+                Ok(())
+            }
+            Err(err) => {
+                eprintln!(
+                    "[ERROR] rollback to height {} failed: {:?}. Restoring last known safe state at height {}.",
+                    target_height, err, backup_height
+                );
 
-        // NOTE: VerkleTree is not fully versioned; reset to the storage snapshot.
-        if let Ok(tree) = VerkleTree::new(snapshot_storage.clone()) {
-            self.tree = tree;
-        } else {
-            panic!("Failed to restore VerkleTree during rollback");
+                // Restore safe state from backup
+                self.tree = backup_tree;
+                self.current_height = backup_height;
+                self.snapshots = backup_snapshots;
+                self.snapshot_storages = backup_snapshot_storages;
+                self.current_total_supply = backup_total_supply;
+                self.block_gas_fees = backup_gas_fees;
+
+                Err(err)
+            }
         }
     }
 
@@ -257,6 +465,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
         Ok(StateSnapshot {
             height: self.current_height,
             root,
+            total_supply: self.current_total_supply,
+            gas_fees: self.block_gas_fees.clone(),
         })
     }
 
@@ -322,6 +532,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> StateManager<S> {
         }
 
         Ok(())
+    }
+}
+
+impl From<CoreError> for StateManagerError {
+    fn from(err: CoreError) -> Self {
+        StateManagerError::CryptographicError(format!("CoreError: {}", err))
     }
 }
 
@@ -421,7 +637,7 @@ mod tests {
         assert_ne!(root1, root2);
         assert_eq!(manager.current_height, 2);
 
-        manager.rollback(1);
+        manager.rollback(1).expect("rollback failed");
 
         assert_eq!(manager.current_height, 1);
         assert_eq!(manager.snapshots.len(), 2);

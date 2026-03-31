@@ -22,6 +22,10 @@ impl Hash {
         Self(array)
     }
 
+    pub fn from_bytes(bytes: &[u8; 32]) -> Self {
+        Self(*bytes)
+    }
+
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }

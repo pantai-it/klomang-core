@@ -18,10 +18,21 @@ type EmptySubtreeConstantsResult = Result<(RootHashes, ScalarValues), CoreError>
 const VERKLE_RADIX: usize = 256;
 const KEY_SIZE: usize = 32;
 
+/// Special key for storing total supply in Verkle Tree
+const TOTAL_SUPPLY_KEY: [u8; 32] = [0u8; 32];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProofType {
     Membership,
     NonMembership,
+}
+
+/// Gas fee distribution witness for 80/20 validation
+#[derive(Debug, Clone)]
+pub struct GasFeeWitness {
+    pub total_gas_fee: u128,
+    pub miner_share: u128,
+    pub fullnode_share: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +42,7 @@ pub struct VerkleProof {
     pub siblings: Vec<[u8; 32]>,
     pub leaf_value: Option<Vec<u8>>,
     pub root: [u8; 32],
+    pub gas_fee_distribution: Option<GasFeeWitness>,
 }
 
 /// In-memory storage-backed 256-ary Verkle tree.
@@ -70,6 +82,44 @@ impl<S: Storage> VerkleTree<S> {
         }
 
         self.set_node_value(&path, Some(value));
+    }
+
+    /// Apply state transition with hardcoded anti-burn enforcement and supply cap validation
+    pub fn apply_state_transition(&mut self, updates: Vec<([u8; KEY_SIZE], Vec<u8>)>, new_total_supply: u128) -> Result<(), CoreError> {
+        use crate::core::consensus::economic_constants;
+        use crate::core::state::transaction::TxOutput;
+
+        // HARD CODED ANTI-BURN: Block any updates that would send to burn address
+        for (key, value) in &updates {
+            // Attempt to deserialize as TxOutput to check for burn address
+            if let Ok(output) = TxOutput::deserialize(value) {
+                if output.pubkey_hash.as_bytes() == &economic_constants::BURN_ADDRESS {
+                    return Err(CoreError::InvalidState(
+                        format!("State transition blocked: attempt to send to burn address in key {:?}", key)
+                    ));
+                }
+            }
+            // For other value types, we assume they are validated at higher level
+        }
+
+        // Update the tree with new state
+        for (key, value) in updates {
+            self.insert(key, value);
+        }
+
+        // Store new total supply in Verkle Tree for cryptographic locking
+        let supply_bytes = new_total_supply.to_le_bytes().to_vec();
+        self.insert(TOTAL_SUPPLY_KEY, supply_bytes);
+
+        // HARD CAP VALIDATION: Verify supply cap is not exceeded
+        if new_total_supply > economic_constants::MAX_GLOBAL_SUPPLY_NANO_SLUG {
+            return Err(CoreError::InvalidState(format!(
+                "Total supply {} exceeds maximum allowed {}", 
+                new_total_supply, economic_constants::MAX_GLOBAL_SUPPLY_NANO_SLUG
+            )));
+        }
+
+        Ok(())
     }
 
     pub fn get(&self, key: [u8; KEY_SIZE]) -> Result<Option<Vec<u8>>, CoreError> {
@@ -114,6 +164,10 @@ impl<S: Storage> VerkleTree<S> {
     }
 
     pub fn generate_proof(&self, key: [u8; KEY_SIZE]) -> Result<VerkleProof, CoreError> {
+        self.generate_proof_with_witness(key, None)
+    }
+
+    pub fn generate_proof_with_witness(&self, key: [u8; KEY_SIZE], gas_witness: Option<GasFeeWitness>) -> Result<VerkleProof, CoreError> {
         let mut siblings = Vec::with_capacity(KEY_SIZE * VERKLE_RADIX);
         let mut path = Vec::new();
         let mut path_exists = true;
@@ -161,6 +215,7 @@ impl<S: Storage> VerkleTree<S> {
             siblings,
             leaf_value,
             root: self.get_root()?,
+            gas_fee_distribution: gas_witness,
         })
     }
 
@@ -228,6 +283,16 @@ impl<S: Storage> VerkleTree<S> {
 
         if computed_root != proof.root {
             return Ok(false);
+        }
+
+        // Verify gas fee distribution witness if present
+        if let Some(witness) = &proof.gas_fee_distribution {
+            use crate::core::consensus::economic_constants;
+            let expected_miner = (witness.total_gas_fee * economic_constants::MINER_REWARD_PERCENT) / 100;
+            let expected_fullnode = witness.total_gas_fee.saturating_sub(expected_miner);
+            if witness.miner_share != expected_miner || witness.fullnode_share != expected_fullnode {
+                return Ok(false);
+            }
         }
 
         Ok(true)

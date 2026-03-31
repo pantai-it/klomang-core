@@ -18,6 +18,26 @@ impl KeyPairWrapper {
         Self { signing_key }
     }
 
+    pub fn from_seed(seed: u64) -> Result<Self, CoreError> {
+        // Deterministic key derivation via blake3(seed || counter) with fallback to avoid zero scalar.
+        for counter in 0u64..1024 {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&seed.to_le_bytes());
+            hasher.update(&counter.to_le_bytes());
+            let digest = hasher.finalize();
+            let mut secret_bytes = [0u8; 32];
+            secret_bytes.copy_from_slice(&digest.as_bytes()[..32]);
+
+            if let Ok(signing_key) = SigningKey::from_bytes(&secret_bytes) {
+                return Ok(KeyPairWrapper { signing_key });
+            }
+        }
+
+        Err(CoreError::CryptographicError(
+            "Failed to derive deterministic keypair from seed".to_string(),
+        ))
+    }
+
     pub fn public_key(&self) -> VerifyingKey {
         *self.signing_key.verifying_key()
     }

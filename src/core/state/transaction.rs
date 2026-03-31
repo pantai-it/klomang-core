@@ -221,6 +221,15 @@ impl TxOutput {
         bytes.extend_from_slice(self.pubkey_hash.as_bytes());
         bytes
     }
+
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != 8 + 32 {
+            return Err("Invalid length for TxOutput".to_string());
+        }
+        let value = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let pubkey_hash = Hash::from_bytes(&bytes[8..40].try_into().unwrap());
+        Ok(TxOutput { value, pubkey_hash })
+    }
 }
 
 impl Default for Transaction {

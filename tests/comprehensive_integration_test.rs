@@ -9,7 +9,7 @@
 //!
 //! Target: 90% code coverage for src/core/
 
-use klomang_core::core::crypto::Hash;
+use klomang_core::core::crypto::{Hash, schnorr::KeyPairWrapper};
 use klomang_core::core::dag::{Dag, BlockNode};
 use klomang_core::core::state::transaction::{Transaction, TxOutput, TxInput, SigHashType};
 use klomang_core::core::state::utxo::UtxoSet;
@@ -21,6 +21,38 @@ use klomang_core::core::consensus::emission::{raw_block_reward, block_reward, CO
 use klomang_core::core::state::BlockchainState;
 use klomang_core::core::config::Config;
 use std::collections::HashSet;
+
+// ============================================================================
+// PAYLOAD & KEY GENERATOR UTILITIES - Deterministic generation from seed
+// ============================================================================
+
+/// Generate deterministic but unique signature (64 bytes) from seed using real Schnorr signing key.
+fn generate_signature_from_seed(seed: u64) -> Vec<u8> {
+    let keypair = KeyPairWrapper::from_seed(seed)
+        .expect("deterministic keypair derivation should not fail");
+    let message = seed.to_be_bytes();
+    keypair.sign(&message).to_bytes().to_vec()
+}
+
+/// Generate deterministic public key (33 bytes) from seed using real Schnorr key material.
+fn generate_pubkey_from_seed(seed: u64) -> Vec<u8> {
+    let keypair = KeyPairWrapper::from_seed(seed)
+        .expect("deterministic keypair derivation should not fail");
+    keypair.public_key().to_bytes().to_vec()
+}
+
+/// Generate deterministic 32-byte hash from seed using cryptographic hash function.
+fn generate_hash_from_seed(seed: u64) -> [u8; 32] {
+    let hash = Hash::new(&seed.to_le_bytes());
+    *hash.as_bytes()
+}
+
+/// Generate deterministic sequence-based recipient key for make_output
+/// Ensures each call with different base_seed generates unique but reproducible output
+fn generate_recipient_key(base_seed: u64, offset: u64) -> [u8; 32] {
+    let seed = base_seed.wrapping_add(offset);
+    generate_hash_from_seed(seed)
+}
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -66,11 +98,25 @@ fn make_output(value: u64, recipient: &[u8]) -> TxOutput {
 }
 
 fn make_input(prev_tx: &[u8], index: u32) -> TxInput {
+    // Generate deterministic keypair and sign the input reference using cryptographic signing
+    let mut bytes = [0u8; 8];
+    let copy_len = prev_tx.len().min(8);
+    bytes[..copy_len].copy_from_slice(&prev_tx[..copy_len]);
+    let seed = u64::from_le_bytes(bytes).wrapping_add(index as u64);
+
+    let keypair = KeyPairWrapper::from_seed(seed)
+        .expect("deterministic keypair derivation should not fail");
+
+    let mut msg = Vec::new();
+    msg.extend_from_slice(prev_tx);
+    msg.extend_from_slice(&index.to_le_bytes());
+    let signature = keypair.sign(&msg).to_bytes().to_vec();
+
     TxInput {
         prev_tx: Hash::new(prev_tx),
         index,
-        signature: vec![0x00; 64],
-        pubkey: vec![0x00; 33],
+        signature,
+        pubkey: keypair.public_key().to_bytes().to_vec(),
         sighash_type: SigHashType::All,
     }
 }
@@ -386,8 +432,9 @@ fn test_30_verkle_tree_root_consistency() {
 fn test_31_verkle_tree_insert() {
     let storage = MemoryStorage::new();
     let mut tree = VerkleTree::new(storage).expect("create tree");
-    let key = [0x01u8; 32];
-    tree.insert(key, vec![0x10; 32]);
+    let key = generate_hash_from_seed(100);
+    let value = generate_hash_from_seed(101);
+    tree.insert(key, value.to_vec());
     let root = tree.get_root().expect("get root");
     assert_eq!(root.len(), 32);
 }
@@ -397,9 +444,9 @@ fn test_32_verkle_tree_multiple_inserts() {
     let storage = MemoryStorage::new();
     let mut tree = VerkleTree::new(storage).expect("create tree");
     for i in 0u8..10 {
-        let mut key = [0u8; 32];
-        key[0] = i;
-        tree.insert(key, vec![i; 32]);
+        let key = generate_hash_from_seed(200 + i as u64);
+        let value = generate_hash_from_seed(300 + i as u64);
+        tree.insert(key, value.to_vec());
     }
     let root = tree.get_root().expect("get root");
     assert_eq!(root.len(), 32);
@@ -409,8 +456,9 @@ fn test_32_verkle_tree_multiple_inserts() {
 fn test_33_verkle_tree_generate_proof() {
     let storage = MemoryStorage::new();
     let mut tree = VerkleTree::new(storage).expect("create tree");
-    let key = [0x01u8; 32];
-    tree.insert(key, vec![0x10; 32]);
+    let key = generate_hash_from_seed(400);
+    let value = generate_hash_from_seed(401);
+    tree.insert(key, value.to_vec());
     let _proof = tree.generate_proof(key).expect("generate proof");
 }
 
@@ -418,8 +466,9 @@ fn test_33_verkle_tree_generate_proof() {
 fn test_34_verkle_tree_verify_proof() {
     let storage = MemoryStorage::new();
     let mut tree = VerkleTree::new(storage).expect("create tree");
-    let key = [0x01u8; 32];
-    tree.insert(key, vec![0x10; 32]);
+    let key = generate_hash_from_seed(500);
+    let value = generate_hash_from_seed(501);
+    tree.insert(key, value.to_vec());
     let proof = tree.generate_proof(key).expect("generate proof");
     let valid = tree.verify_proof(&proof).expect("verify proof");
     assert!(valid);
@@ -678,8 +727,10 @@ fn test_58_workflow_state_snapshots() {
 fn test_59_workflow_block_commitment() {
     let storage = MemoryStorage::new();
     let mut tree = VerkleTree::new(storage).expect("create tree");
-    let _ = tree.insert([0x01u8; 32], vec![0x10; 32]);
-    let proof = tree.generate_proof([0x01u8; 32]).expect("generate proof");
+    let key = generate_hash_from_seed(600);
+    let value = generate_hash_from_seed(601);
+    let _ = tree.insert(key, value.to_vec());
+    let proof = tree.generate_proof(key).expect("generate proof");
     let valid = tree.verify_proof(&proof).expect("verify proof");
     assert!(valid);
 }
@@ -771,9 +822,9 @@ fn test_67_verkle_large_dataset() {
     let storage = MemoryStorage::new();
     let mut tree = VerkleTree::new(storage).expect("create tree");
     for i in 0u16..50 {
-        let mut key = [0u8; 32];
-        key[0] = (i / 256) as u8;
-        let _ = tree.insert(key, vec![i as u8; 32]);
+        let key = generate_hash_from_seed(700 + i as u64);
+        let value = generate_hash_from_seed(800 + i as u64);
+        let _ = tree.insert(key, value.to_vec());
     }
     let root = tree.get_root().expect("get root");
     assert_eq!(root.len(), 32);

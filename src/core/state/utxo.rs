@@ -3,6 +3,7 @@ use crate::core::crypto::Hash;
 use crate::core::state::transaction::{Transaction, TxOutput};
 use crate::core::crypto::schnorr;
 use crate::core::errors::CoreError;
+use crate::core::consensus::economic_constants;
 
 /// OutPoint: (tx_id, output_index)
 pub type OutPoint = (Hash, u32);
@@ -30,16 +31,21 @@ impl UtxoSet {
     pub const ZERO_ADDRESS: [u8; 32] = [0u8; 32];
 
     pub fn validate_tx(&self, tx: &Transaction) -> Result<u64, CoreError> {
-        // Anti-Deflationary: reject outputs to null/burn address, including coinbase
-        let zero_address_hash = crate::core::crypto::Hash::new(&Self::ZERO_ADDRESS);
-        for output in &tx.outputs {
-            if output.pubkey_hash == zero_address_hash {
-                println!(
-                    "[utxo][validate_tx] reject tx {} output to ZERO_ADDRESS",
-                    tx.id
+        // ANTI-DEFLATIONARY ENFORCEMENT:
+        // Reject all outputs to burn address (zero address)
+        // This applies to regular transactions AND coinbase transactions
+        // 
+        // Policy: 100% of Nano-SLUG must stay in circulation - no burns ever allowed
+        let burn_address_hash = crate::core::crypto::Hash::new(&economic_constants::BURN_ADDRESS);
+        for (output_idx, output) in tx.outputs.iter().enumerate() {
+            if output.pubkey_hash == burn_address_hash {
+                let error_msg = format!(
+                    "[ANTI-DEFLATIONARY] Transaction {} output #{} attempts to send {} Nano-SLUG to burn address - REJECTED",
+                    tx.id, output_idx, output.value
                 );
+                eprintln!("{}", error_msg);
                 return Err(CoreError::TransactionError(
-                    "Output to zero address (burn) is prohibited".to_string(),
+                    "Output to zero address (burn) is prohibited by economic policy".to_string(),
                 ));
             }
         }

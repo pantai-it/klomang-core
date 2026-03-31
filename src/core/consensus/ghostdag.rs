@@ -1,6 +1,16 @@
 use std::collections::{HashSet, HashMap};
 use crate::core::crypto::Hash;
-use crate::core::dag::Dag;
+use crate::core::dag::{Dag, BlockNode};
+use crate::core::crypto::schnorr;
+use crate::core::pow::hash;
+use crate::core::state::v_trie::VerkleTree;
+use crate::core::state::storage::Storage;
+use crate::core::errors::CoreError;
+use std::time::{SystemTime, UNIX_EPOCH};
+use k256::schnorr::{Signature, VerifyingKey};
+
+// Finality depth constant - blocks beyond this depth cannot be reorganized
+pub const FINALITY_DEPTH: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct VirtualBlock {
@@ -14,11 +24,258 @@ pub struct VirtualBlock {
 #[derive(Debug, Clone)]
 pub struct GhostDag {
     pub k: usize,
+    /// Network condition metrics for adaptive k adjustment
+    pub network_load: f64, // 0.0 to 1.0, higher means more congested
+    pub last_adjustment_time: u64,
 }
+
+// Constants for adaptive k adjustment
+const K_MIN: usize = 1;
+const K_MAX: usize = 10;
+const ADJUSTMENT_INTERVAL: u64 = 3600; // 1 hour in seconds
+const HIGH_LOAD_THRESHOLD: f64 = 0.8;
+const LOW_LOAD_THRESHOLD: f64 = 0.2;
 
 impl GhostDag {
     pub fn new(k: usize) -> Self {
-        Self { k }
+        Self {
+            k: k.clamp(K_MIN, K_MAX),
+            network_load: 0.0,
+            last_adjustment_time: 0,
+        }
+    }
+
+    /// Create with adaptive k based on initial network conditions
+    pub fn new_adaptive(initial_load: f64) -> Self {
+        let mut gd = Self::new(1);
+        gd.update_network_load(initial_load);
+        gd.adjust_k();
+        gd
+    }
+
+    /// Update network load metric (0.0 = idle, 1.0 = congested)
+    pub fn update_network_load(&mut self, load: f64) {
+        self.network_load = load.clamp(0.0, 1.0);
+    }
+
+    /// Adjust k parameter based on network conditions
+    pub fn adjust_k(&mut self) {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if current_time - self.last_adjustment_time < ADJUSTMENT_INTERVAL {
+            return; // Too soon to adjust
+        }
+
+        let new_k = if self.network_load > HIGH_LOAD_THRESHOLD {
+            // High congestion - increase k to reduce selfish mining advantage
+            (self.k + 1).min(K_MAX)
+        } else if self.network_load < LOW_LOAD_THRESHOLD {
+            // Low congestion - decrease k for better performance
+            (self.k - 1).max(K_MIN)
+        } else {
+            self.k // Keep current
+        };
+
+        if new_k != self.k {
+            println!("Adjusting GhostDag k from {} to {} (network load: {:.2})",
+                    self.k, new_k, self.network_load);
+            self.k = new_k;
+            self.last_adjustment_time = current_time;
+        }
+    }
+
+    /// Validate block comprehensively before acceptance
+    /// Returns Ok(()) if block is valid, Err with reason if invalid
+    pub fn validate_block<S: Storage>(
+        &self,
+        block: &BlockNode,
+        dag: &Dag,
+        verkle_tree: &VerkleTree<S>,
+        current_time: u64
+    ) -> Result<(), CoreError> {
+        // 0. DAG connectivity check (parents exist)
+        for parent in &block.parents {
+            if dag.get_block(parent).is_none() {
+                return Err(CoreError::ConsensusError(
+                    format!("Parent block {} not found in DAG", parent)
+                ));
+            }
+        }
+
+        // 1. Validate timestamp
+        let max_future_time = 2 * 60 * 60; // 2 hours tolerance into the future
+        let max_past_time = 24 * 60 * 60;  // 24 hours tolerance into the past
+
+        if block.timestamp > current_time.saturating_add(max_future_time) {
+            return Err(CoreError::ConsensusError(
+                format!("Block timestamp {} is too far in the future (current: {})", block.timestamp, current_time)
+            ));
+        }
+
+        if block.timestamp < current_time.saturating_sub(max_past_time) {
+            return Err(CoreError::ConsensusError(
+                format!("Block timestamp {} is too far in the past (current: {})", block.timestamp, current_time)
+            ));
+        }
+
+        // 2. Validate difficulty
+        if block.difficulty == 0 {
+            return Err(CoreError::ConsensusError("Block difficulty cannot be zero".to_string()));
+        }
+
+        // 3. Validate PoW
+        let tx_root = self.compute_transaction_merkle_root(&block.transactions);
+        let block_hash = hash::calculate_hash(
+            block.timestamp,
+            block.difficulty,
+            &block.parents.iter().cloned().collect::<Vec<_>>(),
+            block.blue_score,
+            block.nonce,
+            &tx_root,
+        );
+        if !hash::is_valid_pow(&block_hash, block.difficulty) {
+            return Err(CoreError::ConsensusError(
+                format!("Invalid PoW: hash {} does not meet difficulty {}", block_hash, block.difficulty)
+            ));
+        }
+
+        // 4. Validate transactions
+        self.validate_transactions(block, dag)?;
+
+        // 5. Validate Verkle state integrity
+        self.validate_verkle_proof(block, verkle_tree)?;
+
+        Ok(())
+    }
+
+    /// Compute simple merkle root of transactions
+    fn compute_transaction_merkle_root(&self, transactions: &[crate::core::state::transaction::Transaction]) -> Hash {
+        if transactions.is_empty() {
+            return Hash::new(&[]);
+        }
+
+        let mut hashes: Vec<Hash> = transactions.iter()
+            .map(|tx| tx.id.clone())
+            .collect();
+
+        while hashes.len() > 1 {
+            let mut new_hashes = Vec::new();
+            for chunk in hashes.chunks(2) {
+                let mut combined = Vec::new();
+                combined.extend_from_slice(chunk[0].as_bytes());
+                if chunk.len() > 1 {
+                    combined.extend_from_slice(chunk[1].as_bytes());
+                }
+                new_hashes.push(Hash::new(&combined));
+            }
+            hashes = new_hashes;
+        }
+
+        hashes[0].clone()
+    }
+
+    /// Validate all transactions in block
+    fn validate_transactions(&self, block: &BlockNode, _dag: &Dag) -> Result<(), CoreError> {
+        let mut spent_outpoints = HashSet::new();
+        for tx in &block.transactions {
+            // Validate TX hash matches body
+            let expected_id = tx.calculate_id();
+            if tx.id != expected_id {
+                return Err(CoreError::ConsensusError(
+                    format!("Invalid transaction id: expected {} but got {}", expected_id, tx.id)
+                ));
+            }
+
+            for input in &tx.inputs {
+                let outpoint = (input.prev_tx.clone(), input.index);
+                if !spent_outpoints.insert(outpoint.clone()) {
+                    return Err(CoreError::ConsensusError(
+                        format!("Double-spend across block detected for outpoint {:?}", outpoint)
+                    ));
+                }
+            }
+
+            // Validate transaction signatures and structure
+            self.validate_transaction_signatures(tx)?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate signatures for a single transaction
+    fn validate_transaction_signatures(&self, tx: &crate::core::state::transaction::Transaction) -> Result<(), CoreError> {
+        for (input_idx, input) in tx.inputs.iter().enumerate() {
+            if input.signature.is_empty() {
+                return Err(CoreError::ConsensusError(
+                    format!("Missing signature for input {} in transaction {}", input_idx, tx.id)
+                ));
+            }
+
+            let sighash = schnorr::compute_sighash(tx, input_idx, input.sighash_type)
+                .map_err(|e| CoreError::CryptographicError(format!("Sighash error: {}", e)))?;
+
+            let pubkey = VerifyingKey::from_bytes(&input.pubkey)
+                .map_err(|e| CoreError::CryptographicError(format!("Invalid pubkey: {}", e)))?;
+
+            let signature = Signature::try_from(input.signature.as_slice())
+                .map_err(|e| CoreError::CryptographicError(format!("Invalid signature: {}", e)))?;
+
+            if !schnorr::verify(&pubkey, &sighash, &signature) {
+                return Err(CoreError::ConsensusError(
+                    format!("Invalid signature for input {} in transaction {}", input_idx, tx.id)
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert an outpoint (prev_tx, index) into the UTXO key used in Verkle state
+    fn outpoint_key(prev_tx: &Hash, index: u32) -> [u8; 32] {
+        let mut id_data = Vec::with_capacity(36);
+        id_data.extend_from_slice(prev_tx.as_bytes());
+        id_data.extend_from_slice(&index.to_be_bytes());
+        *Hash::new(&id_data).as_bytes()
+    }
+
+    /// Validate Verkle proof for state transition
+    fn validate_verkle_proof<S: Storage>(
+        &self,
+        block: &BlockNode,
+        verkle_tree: &VerkleTree<S>
+    ) -> Result<(), CoreError> {
+        for tx in &block.transactions {
+            // Ensure all inputs are present in current state
+            for input in &tx.inputs {
+                let key = Self::outpoint_key(&input.prev_tx, input.index);
+                match verkle_tree.get(key) {
+                    Ok(Some(_value)) => (),
+                    Ok(None) => {
+                        return Err(CoreError::ConsensusError(
+                            format!("Missing input UTXO in Verkle tree for outpoint ({}, {})", input.prev_tx, input.index)
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(CoreError::CryptographicError(format!("Verkle tree query failed: {}", e)));
+                    }
+                }
+            }
+
+            // Ensure outputs do not collide with existing UTXO keys
+            for (idx, _output) in tx.outputs.iter().enumerate() {
+                let out_key = tx.hash_with_index(idx as u32);
+                if let Ok(Some(_existing)) = verkle_tree.get(out_key) {
+                    return Err(CoreError::ConsensusError(
+                        format!("Output key collision in Verkle tree for tx {} output {}", tx.id, idx)
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn select_parent(&self, dag: &Dag, parents: &[Hash]) -> Option<Hash> {
@@ -312,14 +569,45 @@ impl GhostDag {
     }
 
     /// Check if a block/transaction is final (irreversible)
-    /// A block is considered final if its blue score is below the virtual blue score by a certain threshold
+    /// A block is considered final if its blue score is below the virtual blue score by at least FINALITY_DEPTH
     pub fn check_finality(&self, dag: &Dag, block_hash: &Hash, finality_threshold: u64) -> bool {
         let virtual_block = self.build_virtual_block(dag);
         let block_blue_score = dag.get_block(block_hash)
             .map(|b| b.blue_score)
             .unwrap_or(0);
 
-        virtual_block.blue_score.saturating_sub(block_blue_score) >= finality_threshold
+        virtual_block.blue_score.saturating_sub(block_blue_score) >= finality_threshold.max(FINALITY_DEPTH)
+    }
+
+    /// Check if reorganization to target block would violate finality
+    pub fn can_reorganize(&self, dag: &Dag, target_block: &Hash) -> Result<bool, CoreError> {
+        let virtual_block = self.build_virtual_block(dag);
+        let target_blue_score = dag.get_block(target_block)
+            .map(|b| b.blue_score)
+            .ok_or_else(|| CoreError::ConsensusError(format!("Block {} not found", target_block)))?;
+
+        // use target stake (blue score) for reorganize strictness in future enhancements
+        let _target_blue_score = target_blue_score;
+
+        // Find the common ancestor
+        let mut current = Some(target_block.clone());
+        let mut depth = 0u64;
+
+        while let Some(hash) = current {
+            if virtual_block.parents.contains(&hash) {
+                break; // Found common ancestor
+            }
+            current = dag.get_block(&hash).and_then(|b| b.selected_parent.clone());
+            depth += 1;
+
+            // Prevent infinite loops
+            if depth > 10000 {
+                return Err(CoreError::ConsensusError("Chain too deep while finding common ancestor".to_string()));
+            }
+        }
+
+        // If depth to common ancestor exceeds finality, cannot reorganize
+        Ok(depth <= FINALITY_DEPTH)
     }
 }
 
